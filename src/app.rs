@@ -13,14 +13,15 @@ use crate::{
     zed::open_file_pair,
 };
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, IntoElement, PathPromptOptions, Render,
-    ScrollHandle, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, relative, rgb, size, uniform_list,
+    AnyElement, App, Application, Bounds, Context, IntoElement, PathPromptOptions, Pixels, Render,
+    ScrollHandle, SharedString, Task, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, relative, rgb, rgba, size, uniform_list,
 };
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
 
 fn lock_merge_manager(manager: &Mutex<MergeManager>) -> MutexGuard<'_, MergeManager> {
@@ -33,6 +34,21 @@ const SIDEBAR_WIDTH: f32 = 318.0;
 const GUTTER_WIDTH: f32 = 48.0;
 const RAIL_WIDTH: f32 = 64.0;
 const DIFF_ROW_HEIGHT: f32 = 24.0;
+const SCROLLBAR_HIDE_DELAY: Duration = Duration::from_millis(700);
+const SCROLLBAR_INSET: Pixels = px(3.0);
+const SCROLLBAR_MIN_HEIGHT: Pixels = px(28.0);
+
+#[derive(Clone, Copy)]
+enum ScrollPane {
+    Tree,
+    Diff,
+}
+
+#[derive(Default)]
+struct TransientScrollbar {
+    visible: bool,
+    hide_task: Option<Task<()>>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntryFilter {
@@ -94,6 +110,8 @@ pub struct FolderDiffApp {
     scan_duration_ms: Option<u128>,
     tree_scroll: ScrollHandle,
     diff_scroll: UniformListScrollHandle,
+    tree_scrollbar: TransientScrollbar,
+    diff_scrollbar: TransientScrollbar,
 }
 
 impl FolderDiffApp {
@@ -118,6 +136,8 @@ impl FolderDiffApp {
             scan_duration_ms: None,
             tree_scroll: ScrollHandle::new(),
             diff_scroll: UniformListScrollHandle::new(),
+            tree_scrollbar: TransientScrollbar::default(),
+            diff_scrollbar: TransientScrollbar::default(),
         };
         if this.roots().is_some() {
             this.refresh(cx);
@@ -130,6 +150,85 @@ impl FolderDiffApp {
             self.config.left_root.as_deref()?,
             self.config.right_root.as_deref()?,
         ))
+    }
+
+    fn scrollbar_mut(&mut self, pane: ScrollPane) -> &mut TransientScrollbar {
+        match pane {
+            ScrollPane::Tree => &mut self.tree_scrollbar,
+            ScrollPane::Diff => &mut self.diff_scrollbar,
+        }
+    }
+
+    fn show_scrollbar(&mut self, pane: ScrollPane, cx: &mut Context<Self>) {
+        let scrollbar = self.scrollbar_mut(pane);
+        scrollbar.visible = true;
+        drop(scrollbar.hide_task.take());
+        cx.notify();
+
+        let timer = cx.background_executor().timer(SCROLLBAR_HIDE_DELAY);
+        let hide_task = cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                this.scrollbar_mut(pane).visible = false;
+                cx.notify();
+            })
+            .ok();
+        });
+        self.scrollbar_mut(pane).hide_task = Some(hide_task);
+    }
+
+    fn render_scrollbar_thumb(
+        visible: bool,
+        viewport_height: Pixels,
+        content_height: Pixels,
+        scroll_top: Pixels,
+    ) -> Option<AnyElement> {
+        let max_scroll = content_height - viewport_height;
+        if !visible || viewport_height <= Pixels::ZERO || max_scroll <= Pixels::ZERO {
+            return None;
+        }
+
+        let track_height = (viewport_height - SCROLLBAR_INSET * 2.0).max(Pixels::ZERO);
+        let thumb_height = (track_height * (viewport_height / content_height))
+            .max(SCROLLBAR_MIN_HEIGHT)
+            .min(track_height);
+        let thumb_top = SCROLLBAR_INSET
+            + (track_height - thumb_height)
+                * (scroll_top.clamp(Pixels::ZERO, max_scroll) / max_scroll);
+
+        Some(
+            div()
+                .absolute()
+                .top(thumb_top)
+                .right(SCROLLBAR_INSET)
+                .w(px(5.0))
+                .h(thumb_height)
+                .rounded_full()
+                .bg(rgba(0xb7bec975))
+                .into_any_element(),
+        )
+    }
+
+    fn render_tree_scrollbar(&self) -> Option<AnyElement> {
+        let viewport_height = self.tree_scroll.bounds().size.height;
+        let max_scroll = self.tree_scroll.max_offset().height;
+        Self::render_scrollbar_thumb(
+            self.tree_scrollbar.visible,
+            viewport_height,
+            viewport_height + max_scroll,
+            Pixels::ZERO - self.tree_scroll.offset().y,
+        )
+    }
+
+    fn render_diff_scrollbar(&self) -> Option<AnyElement> {
+        let scroll_state = self.diff_scroll.0.borrow();
+        let item_size = scroll_state.last_item_size?;
+        Self::render_scrollbar_thumb(
+            self.diff_scrollbar.visible,
+            item_size.item.height,
+            item_size.contents.height,
+            Pixels::ZERO - scroll_state.base_handle.offset().y,
+        )
     }
 
     fn save_config(&mut self) {
@@ -852,8 +951,10 @@ impl FolderDiffApp {
             .id("tree-scroll")
             .flex_1()
             .overflow_y_scroll()
-            .scrollbar_width(px(10.0))
             .track_scroll(&self.tree_scroll)
+            .on_scroll_wheel(
+                cx.listener(|this, _, _, cx| this.show_scrollbar(ScrollPane::Tree, cx)),
+            )
             .py_1();
         if rows.is_empty() && !self.loading {
             tree = tree.child(
@@ -874,6 +975,16 @@ impl FolderDiffApp {
                     .map(|(index, row)| self.render_tree_row(row, index, cx)),
             );
         }
+        let tree = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_hidden()
+            .child(tree)
+            .when_some(self.render_tree_scrollbar(), |tree, scrollbar| {
+                tree.child(scrollbar)
+            });
 
         div()
             .flex()
@@ -1262,7 +1373,7 @@ impl FolderDiffApp {
                 )
                 .into_any_element()
         } else {
-            uniform_list(
+            let diff = uniform_list(
                 "diff-scroll",
                 self.diff_rows.len(),
                 cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
@@ -1275,7 +1386,20 @@ impl FolderDiffApp {
             .w_full()
             .bg(rgb(0x12151a))
             .track_scroll(self.diff_scroll.clone())
-            .into_any_element()
+            .on_scroll_wheel(
+                cx.listener(|this, _, _, cx| this.show_scrollbar(ScrollPane::Diff, cx)),
+            );
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .overflow_hidden()
+                .child(diff)
+                .when_some(self.render_diff_scrollbar(), |content, scrollbar| {
+                    content.child(scrollbar)
+                })
+                .into_any_element()
         };
         div()
             .flex()
