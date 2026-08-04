@@ -1,7 +1,9 @@
 use crate::error::Result;
 use crate::{
     config::AppConfig,
-    diff::{DiffBlock, DiffHunk, DisplayLine, apply_hunk, create_diff_blocks},
+    diff::{
+        DiffBlock, DiffHunk, DiffRow, DisplayLine, apply_hunk, create_diff_blocks, create_diff_rows,
+    },
     merge::MergeManager,
     model::{
         ComparisonPreview, DirectoryEntry, EntryStatus, MergeDirection, PreviewKind, ScanResult,
@@ -12,8 +14,8 @@ use crate::{
 };
 use gpui::{
     AnyElement, App, Application, Bounds, Context, IntoElement, PathPromptOptions, Render,
-    ScrollHandle, SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative,
-    rgb, size,
+    ScrollHandle, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, relative, rgb, size, uniform_list,
 };
 use std::{
     collections::HashSet,
@@ -30,6 +32,7 @@ fn lock_merge_manager(manager: &Mutex<MergeManager>) -> MutexGuard<'_, MergeMana
 const SIDEBAR_WIDTH: f32 = 318.0;
 const GUTTER_WIDTH: f32 = 48.0;
 const RAIL_WIDTH: f32 = 64.0;
+const DIFF_ROW_HEIGHT: f32 = 24.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntryFilter {
@@ -78,6 +81,7 @@ pub struct FolderDiffApp {
     selected_path: Option<PathBuf>,
     preview: Option<ComparisonPreview>,
     diff_blocks: Vec<DiffBlock>,
+    diff_rows: Vec<DiffRow>,
     filter: EntryFilter,
     collapsed_folders: HashSet<PathBuf>,
     merge_manager: Arc<Mutex<MergeManager>>,
@@ -89,7 +93,7 @@ pub struct FolderDiffApp {
     toast: Option<String>,
     scan_duration_ms: Option<u128>,
     tree_scroll: ScrollHandle,
-    diff_scroll: ScrollHandle,
+    diff_scroll: UniformListScrollHandle,
 }
 
 impl FolderDiffApp {
@@ -101,6 +105,7 @@ impl FolderDiffApp {
             selected_path: None,
             preview: None,
             diff_blocks: Vec::new(),
+            diff_rows: Vec::new(),
             filter: EntryFilter::All,
             collapsed_folders: HashSet::new(),
             merge_manager: Arc::new(Mutex::new(MergeManager::new())),
@@ -112,7 +117,7 @@ impl FolderDiffApp {
             toast: None,
             scan_duration_ms: None,
             tree_scroll: ScrollHandle::new(),
-            diff_scroll: ScrollHandle::new(),
+            diff_scroll: UniformListScrollHandle::new(),
         };
         if this.roots().is_some() {
             this.refresh(cx);
@@ -192,6 +197,7 @@ impl FolderDiffApp {
             self.entries.clear();
             self.preview = None;
             self.diff_blocks.clear();
+            self.diff_rows.clear();
             cx.notify();
             return;
         };
@@ -245,12 +251,14 @@ impl FolderDiffApp {
                 } else {
                     self.preview = None;
                     self.diff_blocks.clear();
+                    self.diff_rows.clear();
                 }
             }
             Err(error) => {
                 self.entries.clear();
                 self.preview = None;
                 self.diff_blocks.clear();
+                self.diff_rows.clear();
                 self.toast = Some(format!("Comparison failed: {error:#}"));
             }
         }
@@ -287,6 +295,7 @@ impl FolderDiffApp {
                 this.preview_loading = false;
                 match result {
                     Ok((path, preview, blocks)) if this.selected_path.as_ref() == Some(&path) => {
+                        this.diff_rows = create_diff_rows(&blocks);
                         this.preview = Some(preview);
                         this.diff_blocks = blocks;
                     }
@@ -294,6 +303,7 @@ impl FolderDiffApp {
                     Err(error) => {
                         this.preview = None;
                         this.diff_blocks.clear();
+                        this.diff_rows.clear();
                         this.toast = Some(format!("Could not preview file: {error:#}"));
                     }
                 }
@@ -309,9 +319,10 @@ impl FolderDiffApp {
             return;
         }
         self.selected_path = Some(relative_path);
-        self.diff_scroll.set_offset(Default::default());
+        self.diff_scroll = UniformListScrollHandle::new();
         self.preview = None;
         self.diff_blocks.clear();
+        self.diff_rows.clear();
         self.load_preview(cx);
     }
 
@@ -1026,12 +1037,16 @@ impl FolderDiffApp {
         background: u32,
         text_color: u32,
     ) -> AnyElement {
+        let line_number = line.map(|line| line.number.to_string()).unwrap_or_default();
+        let text = line
+            .map(|line| SharedString::new(line.text.clone()))
+            .unwrap_or_default();
         div()
             .flex()
             .flex_1()
             .flex_basis(relative(0.5))
             .overflow_hidden()
-            .h(px(22.0))
+            .h(px(DIFF_ROW_HEIGHT))
             .bg(rgb(background))
             .text_size(px(12.0))
             .child(
@@ -1045,56 +1060,41 @@ impl FolderDiffApp {
                     } else {
                         background
                     }))
-                    .child(line.map(|line| line.number.to_string()).unwrap_or_default()),
+                    .child(line_number),
             )
             .child(
                 div()
                     .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
                     .px_2()
                     .text_color(rgb(text_color))
-                    .child(line.map(|line| line.text.clone()).unwrap_or_default()),
+                    .child(text),
             )
             .into_any_element()
     }
 
-    fn render_equal_rows(&self, left: &[DisplayLine], right: &[DisplayLine]) -> AnyElement {
-        let count = left.len().max(right.len());
-        let mut body = div().flex().flex_col();
-        let render_range = |body: gpui::Div, range: std::ops::Range<usize>| {
-            range.fold(body, |body, index| {
-                body.child(
-                    div()
-                        .flex()
-                        .child(self.render_code_cell(left.get(index), 0x12151a, 0xb9c0cb))
-                        .child(div().w(px(RAIL_WIDTH)).h(px(22.0)).bg(rgb(0x171a20)))
-                        .child(self.render_code_cell(right.get(index), 0x12151a, 0xb9c0cb)),
-                )
-            })
-        };
-        if count <= 10 {
-            body = render_range(body, 0..count);
-        } else {
-            body = render_range(body, 0..3);
-            body = body.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(26.0))
-                    .bg(rgb(0x1a1e25))
-                    .border_t_1()
-                    .border_b_1()
-                    .border_color(rgb(0x303641))
-                    .text_size(px(10.0))
-                    .text_color(rgb(0x747e8e))
-                    .child(format!("⋯ {} unchanged lines ⋯", count - 6)),
-            );
-            body = render_range(body, count - 3..count);
-        }
-        body.into_any_element()
+    fn render_split_line(
+        &self,
+        left: Option<&DisplayLine>,
+        right: Option<&DisplayLine>,
+        left_background: u32,
+        left_text: u32,
+        right_background: u32,
+        right_text: u32,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_none()
+            .w_full()
+            .h(px(DIFF_ROW_HEIGHT))
+            .child(self.render_code_cell(left, left_background, left_text))
+            .child(div().w(px(RAIL_WIDTH)).h_full().bg(rgb(0x1b1f26)))
+            .child(self.render_code_cell(right, right_background, right_text))
+            .into_any_element()
     }
 
-    fn render_hunk(&self, hunk: &DiffHunk, cx: &mut Context<Self>) -> AnyElement {
+    fn render_hunk_header(&self, hunk: &DiffHunk, cx: &mut Context<Self>) -> AnyElement {
         let left_range = if hunk.left.is_empty() {
             "empty".into()
         } else {
@@ -1114,9 +1114,11 @@ impl FolderDiffApp {
             )
         };
         let hunk_id = hunk.id;
-        let header = div()
+        div()
             .flex()
-            .h(px(31.0))
+            .flex_none()
+            .w_full()
+            .h(px(DIFF_ROW_HEIGHT))
             .border_t_1()
             .border_b_1()
             .border_color(rgb(0x3b424e))
@@ -1168,29 +1170,74 @@ impl FolderDiffApp {
                     .text_size(px(10.0))
                     .text_color(rgb(0x83c797))
                     .child(right_range),
-            );
-        let mut body = div().flex().flex_col().child(header);
-        for index in 0..hunk.left.len().max(hunk.right.len()) {
-            body = body.child(
-                div()
-                    .flex()
-                    .child(self.render_code_cell(hunk.left.get(index), 0x2a1c20, 0xf0c3c8))
-                    .child(div().w(px(RAIL_WIDTH)).h(px(22.0)).bg(rgb(0x1b1f26)))
-                    .child(self.render_code_cell(hunk.right.get(index), 0x172820, 0xbbe7c6)),
-            );
+            )
+            .into_any_element()
+    }
+
+    fn render_diff_row(&self, row_index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.diff_rows.get(row_index).copied() else {
+            return div().h(px(DIFF_ROW_HEIGHT)).into_any_element();
+        };
+        match row {
+            DiffRow::Equal {
+                block_index,
+                line_index,
+            } => {
+                let Some(DiffBlock::Equal { left, right }) = self.diff_blocks.get(block_index)
+                else {
+                    return div().h(px(DIFF_ROW_HEIGHT)).into_any_element();
+                };
+                self.render_split_line(
+                    left.get(line_index),
+                    right.get(line_index),
+                    0x12151a,
+                    0xb9c0cb,
+                    0x12151a,
+                    0xb9c0cb,
+                )
+            }
+            DiffRow::EqualGap { omitted_lines } => div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .w_full()
+                .h(px(DIFF_ROW_HEIGHT))
+                .bg(rgb(0x1a1e25))
+                .border_t_1()
+                .border_b_1()
+                .border_color(rgb(0x303641))
+                .text_size(px(10.0))
+                .text_color(rgb(0x747e8e))
+                .child(format!("⋯ {omitted_lines} unchanged lines ⋯"))
+                .into_any_element(),
+            DiffRow::HunkHeader { block_index } => {
+                let Some(DiffBlock::Hunk(hunk)) = self.diff_blocks.get(block_index) else {
+                    return div().h(px(DIFF_ROW_HEIGHT)).into_any_element();
+                };
+                self.render_hunk_header(hunk, cx)
+            }
+            DiffRow::HunkLine {
+                block_index,
+                line_index,
+            } => {
+                let Some(DiffBlock::Hunk(hunk)) = self.diff_blocks.get(block_index) else {
+                    return div().h(px(DIFF_ROW_HEIGHT)).into_any_element();
+                };
+                self.render_split_line(
+                    hunk.left.get(line_index),
+                    hunk.right.get(line_index),
+                    0x2a1c20,
+                    0xf0c3c8,
+                    0x172820,
+                    0xbbe7c6,
+                )
+            }
         }
-        body.into_any_element()
     }
 
     fn render_text_diff(&self, preview: &ComparisonPreview, cx: &mut Context<Self>) -> AnyElement {
-        let mut content = div()
-            .id("diff-scroll")
-            .flex_1()
-            .overflow_y_scroll()
-            .scrollbar_width(px(10.0))
-            .track_scroll(&self.diff_scroll)
-            .bg(rgb(0x12151a));
-        if self.diff_blocks.is_empty() {
+        let content = if self.diff_rows.is_empty() {
             let empty_side = || {
                 div()
                     .flex()
@@ -1203,19 +1250,33 @@ impl FolderDiffApp {
                     .text_color(rgb(0x8f98a7))
                     .child("Empty file")
             };
-            content = content.child(
-                div()
-                    .flex()
-                    .child(empty_side())
-                    .child(div().w(px(RAIL_WIDTH)).h(px(72.0)).bg(rgb(0x171a20)))
-                    .child(empty_side()),
-            );
+            div()
+                .flex_1()
+                .bg(rgb(0x12151a))
+                .child(
+                    div()
+                        .flex()
+                        .child(empty_side())
+                        .child(div().w(px(RAIL_WIDTH)).h(px(72.0)).bg(rgb(0x171a20)))
+                        .child(empty_side()),
+                )
+                .into_any_element()
         } else {
-            content = content.children(self.diff_blocks.iter().map(|block| match block {
-                DiffBlock::Equal { left, right } => self.render_equal_rows(left, right),
-                DiffBlock::Hunk(hunk) => self.render_hunk(hunk, cx),
-            }));
-        }
+            uniform_list(
+                "diff-scroll",
+                self.diff_rows.len(),
+                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                    range
+                        .map(|row_index| this.render_diff_row(row_index, cx))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .flex_1()
+            .w_full()
+            .bg(rgb(0x12151a))
+            .track_scroll(self.diff_scroll.clone())
+            .into_any_element()
+        };
         div()
             .flex()
             .flex_col()

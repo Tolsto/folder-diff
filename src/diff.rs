@@ -1,10 +1,13 @@
 use crate::model::MergeDirection;
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
+
+const EXPANDED_EQUAL_LINE_LIMIT: usize = 10;
+const EQUAL_CONTEXT_LINES: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisplayLine {
     pub number: usize,
-    pub text: String,
+    pub text: Arc<str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,6 +28,24 @@ pub struct DiffHunk {
     pub right_bytes: Range<usize>,
     pub left_start_line: usize,
     pub right_start_line: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiffRow {
+    Equal {
+        block_index: usize,
+        line_index: usize,
+    },
+    EqualGap {
+        omitted_lines: usize,
+    },
+    HunkHeader {
+        block_index: usize,
+    },
+    HunkLine {
+        block_index: usize,
+        line_index: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,7 +180,7 @@ fn display(lines: &[&str], range: Range<usize>) -> Vec<DisplayLine> {
     range
         .map(|index| DisplayLine {
             number: index + 1,
-            text: lines[index].trim_end_matches(['\n', '\r']).to_owned(),
+            text: Arc::from(lines[index].trim_end_matches(['\n', '\r'])),
         })
         .collect()
 }
@@ -214,6 +235,51 @@ pub fn create_diff_blocks(left_text: &str, right_text: &str) -> Vec<DiffBlock> {
         hunk_id += 1;
     }
     blocks
+}
+
+pub(crate) fn create_diff_rows(blocks: &[DiffBlock]) -> Vec<DiffRow> {
+    let mut rows = Vec::new();
+    for (block_index, block) in blocks.iter().enumerate() {
+        match block {
+            DiffBlock::Equal { left, right } => {
+                let line_count = left.len().max(right.len());
+                if line_count <= EXPANDED_EQUAL_LINE_LIMIT {
+                    rows.extend((0..line_count).map(|line_index| DiffRow::Equal {
+                        block_index,
+                        line_index,
+                    }));
+                } else {
+                    rows.extend((0..EQUAL_CONTEXT_LINES).map(|line_index| DiffRow::Equal {
+                        block_index,
+                        line_index,
+                    }));
+                    rows.push(DiffRow::EqualGap {
+                        omitted_lines: line_count - EQUAL_CONTEXT_LINES * 2,
+                    });
+                    rows.extend(
+                        (line_count - EQUAL_CONTEXT_LINES..line_count).map(|line_index| {
+                            DiffRow::Equal {
+                                block_index,
+                                line_index,
+                            }
+                        }),
+                    );
+                }
+            }
+            DiffBlock::Hunk(hunk) => {
+                rows.push(DiffRow::HunkHeader { block_index });
+                rows.extend(
+                    (0..hunk.left.len().max(hunk.right.len())).map(|line_index| {
+                        DiffRow::HunkLine {
+                            block_index,
+                            line_index,
+                        }
+                    }),
+                );
+            }
+        }
+    }
+    rows
 }
 
 pub fn apply_hunk(
@@ -354,6 +420,30 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn flattens_hunks_into_individually_renderable_rows() {
+        let blocks = create_diff_blocks("one\ntwo\nthree\n", "left\nright\nthree\n");
+        let rows = create_diff_rows(&blocks);
+
+        assert!(matches!(rows[0], DiffRow::HunkHeader { .. }));
+        assert!(matches!(rows[1], DiffRow::HunkLine { line_index: 0, .. }));
+        assert!(matches!(rows[2], DiffRow::HunkLine { line_index: 1, .. }));
+        assert!(matches!(rows[3], DiffRow::Equal { line_index: 0, .. }));
+    }
+
+    #[test]
+    fn collapses_large_equal_blocks_in_the_row_index() {
+        let text = (0..20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let blocks = create_diff_blocks(&text, &text);
+        let rows = create_diff_rows(&blocks);
+
+        assert_eq!(rows.len(), 7);
+        assert_eq!(rows[3], DiffRow::EqualGap { omitted_lines: 14 });
+        assert!(matches!(rows[4], DiffRow::Equal { line_index: 17, .. }));
     }
 
     #[test]
