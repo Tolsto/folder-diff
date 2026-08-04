@@ -1,0 +1,35 @@
+[package]
+name = "folder-diff"
+version = "0.2.0"
+edition = "2024"
+description = "A native GPUI directory comparison and merge companion for Zed"
+license = "MIT"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+gpui = { version = "0.2.2", optional = true }
+
+[features]
+default = ["app"]
+app = ["dep:gpui"]
+
+[[bin]]
+name = "folder-diff"
+path = "src/main.rs"
+required-features = ["app"]
+
+[package.metadata.bundle]
+name = "Folder Diff"
+identifier = "dev.folderdiff.companion"
+icon = []
+version = "0.2.0"
+category = "Developer Tool"
+short_description = "Compare and merge directory trees"
+long_description = "A dependency-light native GPUI directory comparison and merge companion designed for Zed."
+osx_minimum_system_version = "12.0"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

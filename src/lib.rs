@@ -1,0 +1,10 @@
+#[cfg(feature = "app")]
+pub mod app;
+pub mod config;
+pub mod diff;
+pub mod error;
+pub mod merge;
+pub mod model;
+pub mod scanner;
+pub mod temp;
+pub mod zed;

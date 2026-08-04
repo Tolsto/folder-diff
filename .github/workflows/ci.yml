@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Check
+        run: cargo check --all-targets
+      - name: Test
+        run: cargo test --lib --no-default-features
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
